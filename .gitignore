@@ -1,0 +1,11 @@
+# python version and enviroment control
+venv/
+.ipynb_checkpoints/
+.python-version
+
+# IDE files
+.idea/
+.vscode/
+
+# Python
+__pycache__/
