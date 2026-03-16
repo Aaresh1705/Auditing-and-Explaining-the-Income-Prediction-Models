@@ -82,6 +82,8 @@ xgb_model = xgb.XGBClassifier()
 xgb_model.load_model("models/xgb_model.json")
 
 import tensorflow as tf
+print("TensorFlow version:", tf.__version__)
+print(tf.config.list_physical_devices('GPU'))
 nn_model = tf.keras.models.load_model("models/nn_model.keras")
 
 print("  Models loaded.")
@@ -124,49 +126,41 @@ shap_vals_xgb = xgb_explainer.shap_values(X_test_num[shap_idx])
 print("Computing SHAP for NN (KernelExplainer -- may take ~1 min) ...")
 background = X_train_scaled[np.random.choice(len(X_train_scaled), 100, replace=False)]
 nn_explainer = shap.KernelExplainer(nn_predict_scalar, background)
-shap_vals_nn = nn_explainer.shap_values(X_test_scaled[shap_idx[:50]], nsamples=100)
+shap_vals_nn = nn_explainer.shap_values(X_test_scaled[shap_idx], nsamples=100)
 
-mean_shap_xgb = pd.Series(np.abs(shap_vals_xgb).mean(axis=0), index=feat_names).nlargest(10)
-mean_shap_nn = pd.Series(np.abs(shap_vals_nn).mean(axis=0), index=feat_names).nlargest(10)
+mean_shap_xgb = pd.Series(np.abs(shap_vals_xgb).mean(axis=0), index=feat_names)
+mean_shap_nn = pd.Series(np.abs(shap_vals_nn).mean(axis=0), index=feat_names)
 
 # Signed mean SHAP for demographic feature columns, split by group
 sex_shap_idx = sex_test[shap_idx]
-sex_shap_idx_nn = sex_test[shap_idx[:50]]
+sex_shap_idx_nn = sex_test[shap_idx]
 race_shap_idx = race_test[shap_idx]
-race_shap_idx_nn = race_test[shap_idx[:50]]
+race_shap_idx_nn = race_test[shap_idx]
 
 sex_feat_cols = [i for i, f in enumerate(feat_names) if "sex" in f.lower()]
 race_feat_cols = [i for i, f in enumerate(feat_names) if "race" in f.lower()]
 
 
-def mean_signed_demo_shap(shap_matrix, group_mask, feat_cols):
-    rows = shap_matrix[group_mask]
-    if len(rows) == 0 or len(feat_cols) == 0:
-        return 0.0
-    return float(rows[:, feat_cols].mean())
+abs_mean_shap_vals_nn = np.abs(shap_vals_nn).mean(axis=0)
+abs_nn_shap_n = abs_mean_shap_vals_nn / abs_mean_shap_vals_nn.sum() # fractional influence of global
+mean_shap_vals_nn = shap_vals_nn.mean(axis=0)
+nn_shap_n = mean_shap_vals_nn / max(min(mean_shap_vals_nn), max(mean_shap_vals_nn), key=abs)
 
+abs_mean_shap_vals_xgb = np.abs(shap_vals_xgb).mean(axis=0)
+abs_xgb_shap_n = abs_mean_shap_vals_xgb / abs_mean_shap_vals_xgb.sum() # fractional influence of global
+mean_shap_vals_xgb = shap_vals_xgb.mean(axis=0)
+xgb_shap_n = mean_shap_vals_xgb / max(min(mean_shap_vals_xgb), max(mean_shap_vals_xgb), key=abs)
 
-xgb_sex_shap = {g: mean_signed_demo_shap(shap_vals_xgb, sex_shap_idx == g, sex_feat_cols)
-                for g in np.unique(sex_shap_idx)}
-nn_sex_shap = {g: mean_signed_demo_shap(shap_vals_nn, sex_shap_idx_nn == g, sex_feat_cols)
-               for g in np.unique(sex_shap_idx_nn)}
-xgb_race_shap = {g: mean_signed_demo_shap(shap_vals_xgb, race_shap_idx == g, race_feat_cols)
-                 for g in np.unique(race_shap_idx)}
-nn_race_shap = {g: mean_signed_demo_shap(shap_vals_nn, race_shap_idx_nn == g, race_feat_cols)
-                for g in np.unique(race_shap_idx_nn)}
+xgb_sex_shap_n = {name: xgb_shap_n[idx] for name, idx in zip(sex_shap_idx, sex_feat_cols)}
+nn_sex_shap_n = {name: nn_shap_n[idx] for name, idx in zip(sex_shap_idx, sex_feat_cols)}
+xgb_race_shap_n = {name: xgb_shap_n[idx] for name, idx in zip(race_shap_idx, race_feat_cols)}
+nn_race_shap_n = {name: nn_shap_n[idx] for name, idx in zip(race_shap_idx, race_feat_cols)}
 
-
-def normalise_shap_dict(d):
-    """Normalise a {group: shap_val} dict so max(|val|) = 1, preserving sign."""
-    scale = max(abs(v) for v in d.values()) or 1.0
-    return {k: v / scale for k, v in d.items()}
-
-
-xgb_sex_shap_n = normalise_shap_dict(xgb_sex_shap)
-nn_sex_shap_n = normalise_shap_dict(nn_sex_shap)
-xgb_race_shap_n = normalise_shap_dict(xgb_race_shap)
-nn_race_shap_n = normalise_shap_dict(nn_race_shap)
-
+# create pandas series containing normalized features (accross features) with values above 0.01
+mean_shap_xgb = pd.Series(abs_xgb_shap_n, index=feat_names).sort_values(ascending=False)
+mean_shap_nn = pd.Series(abs_nn_shap_n, index=feat_names).sort_values(ascending=False)
+mean_shap_xgb = mean_shap_xgb[mean_shap_xgb > 0.01]
+mean_shap_nn = mean_shap_nn[mean_shap_nn > 0.01]
 # ======================================================================================================================
 # 4. LIME
 # ======================================================================================================================
@@ -242,9 +236,9 @@ ax_xgb = fig.add_subplot(outer[0, 0])
 c_xgb  = [C_RED if is_sensitive(f) else C_ORANGE for f in mean_shap_xgb.index]
 bars_a = ax_xgb.barh(mean_shap_xgb.index[::-1], mean_shap_xgb.values[::-1],
                      color=c_xgb[::-1], edgecolor="white", linewidth=0.5)
-ax_xgb.set_title("XGBoost -- Global SHAP Feature Importance\n(mean |SHAP value| over test set)",
+ax_xgb.set_title("XGBoost -- Global SHAP Feature Importance\n(L1 norm of SHAP values)",
                  fontsize=10, fontweight="bold", color=C_DARK)
-ax_xgb.set_xlabel("Mean |SHAP value|", fontsize=8)
+ax_xgb.set_xlabel("L1 of mean |SHAP value|", fontsize=8)
 ax_xgb.tick_params(labelsize=7)
 ax_xgb.set_facecolor(BG)
 for bar, val in zip(bars_a, mean_shap_xgb.values[::-1]):
@@ -258,9 +252,9 @@ ax_nn = fig.add_subplot(outer[0, 1])
 c_nn  = [C_RED if is_sensitive(f) else C_BLUE for f in mean_shap_nn.index]
 bars_b = ax_nn.barh(mean_shap_nn.index[::-1], mean_shap_nn.values[::-1],
                     color=c_nn[::-1], edgecolor="white", linewidth=0.5)
-ax_nn.set_title("Neural Network -- Global SHAP Feature Importance\n(mean |SHAP value| over test set)",
+ax_nn.set_title("Neural Network -- Global SHAP Feature Importance\n(L1 norm of SHAP values)",
                 fontsize=10, fontweight="bold", color=C_DARK)
-ax_nn.set_xlabel("Mean |SHAP value|", fontsize=8)
+ax_nn.set_xlabel("L1 of mean |SHAP value|", fontsize=8)
 ax_nn.tick_params(labelsize=7)
 ax_nn.set_facecolor(BG)
 for bar, val in zip(bars_b, mean_shap_nn.values[::-1]):
@@ -306,7 +300,7 @@ ax_fair.set_facecolor(BG)
 ax_fair.spines[["top"]].set_visible(False)
 
 # Right axis
-ax_fair_s.set_ylabel("Normalised SHAP", fontsize=7, color=C_GRAY)
+ax_fair_s.set_ylabel("MaxAbs Normalised SHAP", fontsize=7, color=C_GRAY)
 ax_fair_s.tick_params(axis="y", labelcolor=C_GRAY, labelsize=7)
 ax_fair_s.spines[["top"]].set_visible(False)
 
@@ -320,7 +314,7 @@ for bar in list(b1) + list(b2):
 
 # SHAP value labels
 for bar, val in list(zip(list(b3) + list(b4), shap_xgb_n + shap_nn_n)):
-    offset = 0.07 if val >= 0 else -0.07
+    offset = 0.01 if val >= 0 else -0.01
     ax_fair_s.text(bar.get_x() + bar.get_width() / 2, val + offset,
                    f"{val:+.2f}", ha="center",
                    va="bottom" if val >= 0 else "top", fontsize=6, color=C_DARK)
@@ -330,7 +324,7 @@ ax_fair.legend(handles=[
     mpatches.Patch(color=C_GREEN, label="SHAP → toward approval"),
     mpatches.Patch(color=C_RED, label="SHAP → toward rejection"),
     mpatches.Patch(facecolor="white", edgecolor=C_DARK, label="XGB"),
-    mpatches.Patch(facecolor="white", edgecolor=C_DARK, hatch="///", label="NN SHAP"),
+    mpatches.Patch(facecolor="white", edgecolor=C_DARK, hatch="///", label="NN"),
 ], fontsize=6.5, loc="upper right", ncol=2)
 
 # (D) Confusion matrices
@@ -424,17 +418,19 @@ nn_top5 = mean_shap_nn.head(5)
 xgb_feats = xgb_top5.index.tolist()[::-1]  # least→most important (bottom→top)
 nn_feats = nn_top5.index.tolist()[::-1]
 
-xgb_norm = (xgb_top5.values / xgb_top5.values.max())[::-1]
-nn_norm = (nn_top5.values / nn_top5.values.max())[::-1]
+xgb_norm = xgb_top5.values[::-1]
+nn_norm = nn_top5.values[::-1]
 
 y = np.arange(5)
 h = 0.55
 
+max_val = max(xgb_norm.max(), nn_norm.max())
+
 cx = [C_RED if is_sensitive(f) else C_ORANGE for f in xgb_feats]
 cn = [C_RED if is_sensitive(f) else C_BLUE for f in nn_feats]
 
-ax_feat.barh(y, [-v for v in xgb_norm], h, color=cx, edgecolor="white", zorder=3)
-ax_feat.barh(y, nn_norm, h, color=cn, edgecolor="white", zorder=3)
+ax_feat.barh(y, [-v/max_val for v in xgb_norm], h, color=cx, edgecolor="white", zorder=1)
+ax_feat.barh(y, nn_norm/max_val, h, color=cn, edgecolor="white", zorder=1)
 
 ax_feat.axvline(0, color=C_DARK, lw=1.8, zorder=4)
 ax_feat.set_xlim(-1.55, 1.55)
@@ -450,8 +446,8 @@ for i, (feat, val) in enumerate(zip(xgb_feats, xgb_norm)):
                  color=fc, fontweight="bold" if is_sensitive(feat) else "normal",
                  clip_on=False)
     # Value: centred inside the bar (only if bar is wide enough)
-    if val > 0.22:
-        ax_feat.text(-val / 2, i, f"{val:.2f}",
+    if val > 0.01:
+        ax_feat.text(-val / 2 / max_val, i, f"{val*100:.1f}%",
                      ha="center", va="center", fontsize=7.5,
                      color="white", fontweight="bold", clip_on=False)
 
@@ -462,8 +458,8 @@ for i, (feat, val) in enumerate(zip(nn_feats, nn_norm)):
                  ha="left", va="center", fontsize=9,
                  color=fc, fontweight="bold" if is_sensitive(feat) else "normal",
                  clip_on=False)
-    if val > 0.22:
-        ax_feat.text(val / 2, i, f"{val:.2f}",
+    if val > 0.01:
+        ax_feat.text(val / 2 / max_val, i, f"{val*100:.1f}%",
                      ha="center", va="center", fontsize=7.5,
                      color="white", fontweight="bold", clip_on=False)
 
@@ -490,7 +486,7 @@ ax_shap2 = ax_fair2.twinx()
 
 sex_groups = sorted(xgb_sex_rates.keys())
 gap_pct = abs(xgb_sex_rates.get("Male", 0) - xgb_sex_rates.get("Female", 0)) * 100
-
+"""
 x = np.arange(len(sex_groups))
 w = 0.20
 
@@ -502,10 +498,9 @@ b1 = ax_fair2.bar(x - w * 1.1, appr_xgb, w, color=C_ORANGE, edgecolor="white",
 b2 = ax_fair2.bar(x, appr_nn, w, color=C_BLUE, edgecolor="white",
                   label="Approval % — Neural Network", zorder=3)
 
-# Signed SHAP bars — normalised independently per model by max(|value|)
-# so each model's strongest bar = ±1.0, preserving sign
-sv_xgb_raw = np.array([xgb_sex_shap.get(g, 0) for g in sex_groups])
-sv_nn_raw = np.array([nn_sex_shap.get(g, 0) for g in sex_groups])
+# Signed SHAP bars — normalised across features sum
+sv_xgb_raw = np.array([xgb_sex_shap_n.get(g, 0) for g in sex_groups])
+sv_nn_raw = np.array([nn_sex_shap_n.get(g, 0) for g in sex_groups])
 
 xgb_shap_scale = np.abs(sv_xgb_raw).max() or 1.0
 nn_shap_scale = np.abs(sv_nn_raw).max() or 1.0
@@ -569,6 +564,67 @@ ax_fair2.legend(handles=[
                    label="NN SHAP"),
 ], fontsize=7.5, loc="upper left", ncol=2)
 ax_fair2.set_facecolor(BG)
+"""
+groups = list(xgb_sex_rates.keys()) + list(xgb_race_rates.keys())
+r_xgb = [xgb_sex_rates[g] for g in xgb_sex_rates] + [xgb_race_rates[g] for g in xgb_race_rates]
+r_nn = [nn_sex_rates[g] for g in xgb_sex_rates] + [nn_race_rates[g] for g in xgb_race_rates]
+shap_xgb_n = [xgb_sex_shap_n.get(g, 0) for g in xgb_sex_rates] + [xgb_race_shap_n.get(g, 0) for g in xgb_race_rates]
+shap_nn_n = [nn_sex_shap_n.get(g, 0) for g in xgb_sex_rates] + [nn_race_shap_n.get(g, 0) for g in xgb_race_rates]
+
+xp = np.arange(len(groups))
+w = 0.20
+
+# Approval rate bars
+b1 = ax_fair2.bar(xp - w * 1.5, r_xgb, w, label="Approval — XGBoost", color=C_ORANGE, edgecolor="white", zorder=3)
+b2 = ax_fair2.bar(xp - w * 0.5, r_nn, w, label="Approval — Neural Network", color=C_BLUE, edgecolor="white", zorder=3)
+
+# Signed normalised SHAP bars
+sc_xgb = [C_GREEN if v >= 0 else C_RED for v in shap_xgb_n]
+sc_nn = [C_GREEN if v >= 0 else C_RED for v in shap_nn_n]
+b3 = ax_shap2.bar(xp + w * 0.5, shap_xgb_n, w, color=sc_xgb, edgecolor="white",
+                   alpha=0.85, label="SHAP — XGBoost (norm.)", zorder=3)
+b4 = ax_shap2.bar(xp + w * 1.5, shap_nn_n, w, color=sc_nn, edgecolor="white",
+                   alpha=0.85, hatch="///", label="SHAP — Neural Network (norm.)", zorder=3)
+ax_fair2.axhline(0, color=C_DARK, lw=0.8, ls="--", zorder=4)
+ax_fair2.set_ylim(-1.4, 1.4)
+
+# Left axis
+ax_fair2.set_xticks(xp)
+ax_fair2.set_xticklabels(groups, rotation=30, ha="right", fontsize=8)
+ax_fair2.set_ylabel("Approval rate (%)", fontsize=8)
+ax_fair2.set_ylim(0, 1.18)
+ax_fair2.set_yticklabels([f"{v:.0f}%" for v in ax_fair2.get_yticks()*100])
+ax_fair2.set_facecolor(BG)
+ax_fair2.spines[["top"]].set_visible(False)
+
+# Right axis
+ax_shap2.set_ylabel("MaxAbs Normalised SHAP", fontsize=7, color=C_GRAY)
+ax_shap2.tick_params(axis="y", labelcolor=C_GRAY, labelsize=7)
+ax_shap2.spines[["top"]].set_visible(False)
+
+ax_fair2.set_title("Fairness Audit: Approval Rate & SHAP by Demographic Group",
+                  fontsize=10, fontweight="bold", color=C_DARK)
+
+# Approval rate value labels
+for bar in list(b1) + list(b2):
+    ax_fair2.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.01,
+                 f"{bar.get_height()*100:.0f}", ha="center", va="bottom", fontsize=6)
+
+# SHAP value labels
+for bar, val in list(zip(list(b3) + list(b4), shap_xgb_n + shap_nn_n)):
+    offset = 0.01 if val >= 0 else -0.01
+    ax_shap2.text(bar.get_x() + bar.get_width() / 2, val + offset,
+                   f"{val*100:.0f}%", ha="center",
+                   va="bottom" if val >= 0 else "top", fontsize=6, color=C_DARK)
+
+ax_fair2.legend(handles=[
+    b1, b2,
+    mpatches.Patch(color=C_GREEN, label="SHAP → toward approval"),
+    mpatches.Patch(color=C_RED, label="SHAP → toward rejection"),
+    mpatches.Patch(facecolor="white", edgecolor=C_DARK, label="XGB"),
+    mpatches.Patch(facecolor="white", edgecolor=C_DARK, hatch="///", label="NN"),
+], fontsize=6.5, loc="upper right", ncol=2)
+
 
 # (D) Verdict card
 ax_card = fig2.add_subplot(gs2[1, 2])
@@ -588,7 +644,6 @@ for li, line in enumerate([
     f"Neural Net accuracy: {nn_acc*100:.1f}%",
     f"XGBoost AUC:         {xgb_auc:.3f}",
     F"Neural Net AUC:        {nn_auc:.3f}",
-    f"Gender gap:          {gap_pct:.1f}%",
     "",
     "*Recommendation:*",
     "Mitigate bias before" if gap_pct>5 else "Ready for",
@@ -767,7 +822,6 @@ actions = [
     ("Hours worked / week", "Working closer to full-time (40 h)\nis viewed positively."),
     ("Investment income", "Any capital gains strongly\nimprove your score."),
     ("Job type", "Managerial or professional roles\ncarry more weight."),
-    ("Work experience", "Longer work history improves\nyour credit profile over time."),
 ]
 cy = 0.92
 for title, desc in actions:
