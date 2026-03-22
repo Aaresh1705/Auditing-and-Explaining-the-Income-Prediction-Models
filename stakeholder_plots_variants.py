@@ -4,6 +4,8 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import matplotlib.gridspec as gridspec
 from matplotlib.colors import LinearSegmentedColormap
+from collections import defaultdict
+import re
 
 C_BLUE   = "#3A86FF"
 C_ORANGE = "#FF6B35"
@@ -158,12 +160,12 @@ def sort_lime(exp):
     order  = np.argsort(vals)
     return [labels[i] for i in order], vals[order]
 
-
+num_features = len(feat_names)
 print("Computing LIME for applicant XGBoost")
 lime_exp_xgb = lime_explainer.explain_instance(
     data_row=x_applicant,
     predict_fn=xgb_model.predict_proba,
-    num_features=10
+    num_features=num_features
 )
 lime_labels_xgb, lime_vals_xgb = sort_lime(lime_exp_xgb)
 
@@ -177,7 +179,7 @@ def nn_predict_proba_lime(x):
 lime_exp_nn = lime_explainer.explain_instance(
     data_row=x_applicant,
     predict_fn=nn_predict_proba_lime,
-    num_features=10
+    num_features=num_features
 )
 lime_labels_nn, lime_vals_nn = sort_lime(lime_exp_nn)
 
@@ -209,52 +211,113 @@ def draw_gauge(ax, proba, accent_col, bg=BG):
 
 
 def _clean_lime_label(raw):
-    import re
     # Strip leading bound e.g. '0.00 < ' before extracting the feature name
     cleaned = re.sub(r"^[-\d.]+\s*[<>]=?\s*", "", raw).strip()
     name = re.split(r"\s*[<>=!]+\s*[-\d.]+", cleaned)[0].strip()
     parts = name.split("_")
-    if len(parts) >= 2:
-        prefix = parts[0]
-        suffix = " ".join(p.capitalize() for p in parts[1:])
-        short = {
-            "native-country": "Country",
-            "marital-status": "Marital",
-            "occupation":     "Job",
-            "workclass":      "Work type",
-            "relationship":   "Relationship",
-            "education":      "Education",
-            "race":           "Race",
-            "sex":            "Gender",
-        }
-        prefix_clean = short.get(prefix, prefix.replace("-", " ").title())
-        label = f"{prefix_clean}: {suffix}"
-    else:
-        label = name.replace("-", " ").replace("_", " ").title()
+    print(parts)
+    prefix = parts[0]
+    print(prefix)
+    short = {
+        "marital-status": "Marital Status",
+        "occupation":     "Occupation",
+        "workclass":      "Work type",
+        "relationship":   "Relationship",
+        "education":      "Education",
+        "fnlwgt":         "Demographic",
+    }
+    prefix_clean = short.get(prefix, prefix.replace("-", " ").title())
+    label = f"{prefix_clean}"
+    print(label)
     return label[:28] + "…" if len(label) > 28 else label
 
 
 def draw_lime_waterfall(ax, labels, vals, applicant_row, model_name, pred_label, accent_col, bg=BG):
+    # --- STEP 1: Define grouping rules (extend this easily) ---
+    print(applicant_row)
+    regex_group_rules = [
+        (r".*occupation.*", "occupation"),
+        (r".*education.*", "education"),
+        (r".*marital-status.*", "marital-status"),
+        (r".*relationship.*", "relationship"),
+        (r".*workclass.*", "workclass")
+    ]
+
+    # --- Helper: format category nicely ---
+    def _format_category(val):
+        if val is None:
+            return "None"
+        val = val.replace(".", " ").replace("_", " ")
+        return val.strip().title()
+
+    # --- Helper: get active OHE category ---
+    def _get_ohe_value(applicant_row, prefix):
+        matches = [col for col in applicant_row.index if col.startswith(prefix + "_")]
+        
+        for col in matches:
+            v = applicant_row[col]
+            if v:
+                return _format_category(col.split(prefix + "_", 1)[1])
+        
+        return "None Specified"
+
+    # --- STEP 2: Normalize + aggregate ---
+    grouped_vals = defaultdict(float)
+
+    for label, val in zip(labels, vals):
+        new_label = label
+        
+        for pattern, replacement in regex_group_rules:
+            if re.match(pattern, label):
+                new_label = replacement
+                break
+        
+        grouped_vals[new_label] += val
+
+    labels = list(grouped_vals.keys())
+    vals = list(grouped_vals.values())
+
+    print("After grouping:")
+    for l, v in zip(labels, vals):
+        print(f"  {l}: {v:.4f}")
+    # --- STEP 3: Sort AFTER grouping ---
+    labels, vals = zip(*sorted(zip(labels, vals), key=lambda x: abs(x[1])))
+    labels = np.array(labels)
+    vals = np.array(vals)
+
+    # --- STEP 4: Clean labels ---
     clean_labels = [_clean_lime_label(l) for l in labels]
+
+    # --- STEP 5: Build display values ---
+    grouped_prefixes = [replacement for _, replacement in regex_group_rules]
+    print("Grouped prefixes:", grouped_prefixes)
+
     display_vals = []
     for raw in labels:
-        # LIME conditions can be  'feat <= 1.0'  or  '0.0 < feat <= 1.0'
-        # Strip all numeric bounds and comparison operators to isolate the feature name
-        import re
+        # Extract base feature name
         feat = re.sub(r"[-\d.]+\s*[<>=]+\s*", "", raw).strip()
         feat = re.sub(r"\s*[<>=]+.*", "", feat).strip()
-        if feat in applicant_row.index:
+
+
+        # --- Handle grouped OHE features ---
+        if feat.split('_')[0] in grouped_prefixes:
+            display_vals.append(_get_ohe_value(applicant_row, feat))
+
+        # --- Handle normal features ---
+        elif feat in applicant_row.index:
             v = applicant_row[feat]
-            if isinstance(v, (int, float, np.number)) and float(v) in (0.0, 1.0) and "_" in feat:
-                # Binary OHE column (has underscore) - Yes/No is more readable than 1/0
-                display_vals.append("Yes" if float(v) == 1.0 else "No")
-            elif isinstance(v, (int, float, np.number)):
-                display_vals.append(str(int(v)) if float(v).is_integer() else f"{v:.2f}")
+
+            if isinstance(v, (int, float, np.number)):
+                if float(v) in (0.0, 1.0) and "_" in feat:
+                    display_vals.append("Yes" if float(v) == 1.0 else "No")
+                else:
+                    display_vals.append(str(int(v)) if float(v).is_integer() else f"{v:.2f}")
             else:
                 display_vals.append("Yes" if v else "No")
+
         else:
             display_vals.append("?")
-
+    print(clean_labels)
     bar_c = [C_RED if v < 0 else C_GREEN for v in vals]
     yp    = np.arange(len(clean_labels))
     bw    = ax.barh(yp, vals, color=bar_c, edgecolor="white", height=0.65)
@@ -272,7 +335,7 @@ def draw_lime_waterfall(ax, labels, vals, applicant_row, model_name, pred_label,
     ax.tick_params(axis="x", labelsize=8)
     for bar, val, disp in zip(bw, vals, display_vals):
         bar_w = abs(val)
-        if bar_w > x_range * 0.18:
+        if bar_w > x_range * 0.5:
             ax.text(val / 2, bar.get_y() + bar.get_height() / 2,
                     disp, va="center", ha="center", fontsize=7.5, color="white", fontweight="bold")
         else:
