@@ -1,0 +1,2 @@
+model,accuracy,roc_auc,n_test_samples,n_features
+XGBoost no_sensitive_no_country,0.8777556440903055,0.936184062143129,15060,51

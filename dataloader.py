@@ -61,7 +61,12 @@ class AdultDataset(Dataset):
                 raise ValueError(f"Unseen category found in column '{col}'")
 
         # Encode target
-        target_map = {"<=50K": 0, ">50K": 1}
+        target_map = {
+            "<=50K": 0,
+            ">50K": 1,
+            "<=50K.": 0,
+            ">50K.": 1,
+        }
         df["income"] = df["income"].map(target_map)
 
         if df["income"].isna().any():
@@ -98,7 +103,7 @@ class AdultDataset(Dataset):
             raise ValueError("split must be 'train' or 'test'")
 
         # Remove whitespace around strings
-        for col in df.select_dtypes(include=["object", "str"]).columns:
+        for col in df.select_dtypes(include=["object"]).columns:
             df[col] = df[col].str.strip()
 
         df = df.replace("?", np.nan).dropna()
