@@ -1,0 +1,31 @@
+concept,layer,tcav_score,p_value
+Female,dense_0_64,0.108,0.9
+Female,dense_2_32,1.0,1.0
+Racial minority,dense_0_64,1.0,0.9
+Racial minority,dense_2_32,0.0,1.0
+Part-time worker,dense_0_64,0.002,0.5
+Part-time worker,dense_2_32,0.0,1.0
+Has investment activity,dense_0_64,1.0,0.6
+Has investment activity,dense_2_32,1.0,1.0
+Unpaid / never worked,dense_0_64,0.0,0.6
+Unpaid / never worked,dense_2_32,0.0,1.0
+Caregiver proxy,dense_0_64,0.994,0.5
+Caregiver proxy,dense_2_32,1.0,1.0
+Immigrant,dense_0_64,0.002,0.8
+Immigrant,dense_2_32,0.0,1.0
+College educated,dense_0_64,0.428,1.0
+College educated,dense_2_32,1.0,1.0
+Married,dense_0_64,1.0,0.4
+Married,dense_2_32,1.0,1.0
+White collar,dense_0_64,1.0,0.6
+White collar,dense_2_32,1.0,1.0
+Near retirement,dense_0_64,1.0,0.8
+Near retirement,dense_2_32,1.0,1.0
+Full-time standard,dense_0_64,1.0,0.8
+Full-time standard,dense_2_32,1.0,1.0
+White collar occupation,dense_0_64,1.0,0.6
+White collar occupation,dense_2_32,1.0,1.0
+Peak career,dense_0_64,1.0,0.5
+Peak career,dense_2_32,1.0,1.0
+Single / never married,dense_0_64,0.0,0.5
+Single / never married,dense_2_32,0.0,1.0
