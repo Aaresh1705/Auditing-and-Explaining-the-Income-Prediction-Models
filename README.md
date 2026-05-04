@@ -1,15 +1,63 @@
 # Auditing-and-Explaining-the-Income-Prediction-Models
 Project 1 and 2 of the XAI & UX special course...
 
-### Participants:
+## Participants:
 ```
 Albert F.K. Hansen - (AlbertFKHansen)
 Kaitlyn Wu Brooks - (KaitlynWuBrooks)
 Marcus Olssen - (Aaresh1705)
 ```
 
+## Version and env control
+The repository depends on several PyPi packages, some of which requires older versions of python.
+To ensure a smooth experience, local version control and a virtual environment is recommended.
 
-### Repository Structure
+### Linux
+Use the automatic installer
+```bash
+curl -fsSL https://pyenv.run | bash
+```
+Then make a local version of python, make a virtual environment, and install packages.
+```bash
+pyenv local 3.11.9
+python -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+```
+
+### MacOS
+You can install pyenv via brew
+```bash
+brew update
+brew install pyenv
+```
+Then make a local version of python, make a virtual environment, and install packages.
+```bash
+pyenv local 3.11.9
+python -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+```
+
+### Windows
+##### Step 1 - Back up your files
+Save anything important — documents, photos, that one folder you definitely didn't name `misc_final_FINAL_v3_USE THIS`.
+
+Your Windows activation key does not need to be backed up.
+
+##### Step 2 — Download Linux (Ubuntu is recommended for beginners)
+Head to ubuntu.com and download the latest LTS release. It's free. It has always been free. You've been paying for an OS this whole time.
+
+##### Step 3 — Create a bootable USB
+Use Balena Etcher or Rufus to flash the ISO to a USB drive.
+
+##### Step 4 — Boot from USB and install
+Restart your machine, spam `F12` (or `F2`, or `Del`), select the USB drive, and follow the installer. When it asks what to do with your disk, click Erase and install.
+
+##### Step 5 — Install pyenv
+Open a terminal. Notice how fast it opens and how clean everything looks. Follow the Linux guide.
+
+## Repository Structure
 
 ```
 .
