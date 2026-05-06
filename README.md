@@ -19,7 +19,7 @@ curl -fsSL https://pyenv.run | bash
 ```
 Then make a local version of python, make a virtual environment, and install packages.
 ```bash
-pyenv local 3.11.9
+pyenv install 3.11.9 && pyenv local 3.11.9
 python -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
@@ -33,7 +33,7 @@ brew install pyenv
 ```
 Then make a local version of python, make a virtual environment, and install packages.
 ```bash
-pyenv local 3.11.9
+pyenv install 3.11.9 && pyenv local 3.11.9
 python -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
