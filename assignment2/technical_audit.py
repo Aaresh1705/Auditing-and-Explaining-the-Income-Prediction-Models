@@ -126,41 +126,57 @@ def run_dim_reduction(embeddings, name, sample_size=2000):
 
     return results, idx
 
-
-def plot_latent_space_grid(dim_results, idx, demo_df, y_test, model_name, filename):
-    """
-    Create a grid: rows = dim-reduction methods (PCA, t-SNE, UMAP),
-    cols = coloring attributes (income, sex, race, age).
-    """
+def plot_latent_space_grid(dim_results, idx, demo_df, y_test, model_proba, model_name, filename):
     methods = list(dim_results.keys())
     n_methods = len(methods)
-    attrs = ["Income", "Sex", "Race", "Age Group"]
 
-    fig, axes = plt.subplots(n_methods, 4, figsize=(20, 5.5 * n_methods),
-                             facecolor=BG, gridspec_kw={"wspace": 0.35, "hspace": 0.35})
+    fig, axes = plt.subplots(
+        n_methods, 5,
+        figsize=(28, 5.5 * n_methods),
+        facecolor=BG,
+        constrained_layout=True,
+    )
     if n_methods == 1:
         axes = axes[np.newaxis, :]
-    fig.suptitle(f"Latent Space: {model_name}\nInternal representations colored by demographic attributes",
-                 fontsize=14, fontweight="bold", color=C_DARK, y=0.98)
+
+    fig.suptitle(
+        f"Latent Space: {model_name}\nInternal representations colored by demographic attributes",
+        fontsize=14, fontweight="bold", color=C_DARK,
+    )
 
     df_sample = demo_df.iloc[idx].copy()
     y_sample = y_test.iloc[idx]
-    age_bins = [0, 25, 40, 60, 100]
-    age_labels = ["<=25", "26-40", "41-60", "60+"]
-    df_sample["age_group"] = pd.cut(df_sample["age"], bins=age_bins, labels=age_labels)
+    proba_sample = model_proba[idx]
 
+    # Income: categorical labels, no colorbar
+    y_labels = pd.Series(y_sample.values).map({0: "≤50K", 1: ">50K"}).values
+    income_colors = {"≤50K": C_RED, ">50K": C_GREEN}
+
+    # Sex: two clearly distinct colors
+    sex_vals = sorted(set(df_sample["sex"].values))
+    sex_colors = dict(zip(sex_vals, [C_BLUE, C_ORANGE][:len(sex_vals)]))
+
+    # Race: Set1 palette for maximum distinctness
+    race_vals = sorted(set(df_sample["race"].values))
+    set1 = plt.cm.Set1.colors
+    race_colors = {v: set1[i % len(set1)] for i, v in enumerate(race_vals)}
+
+    # (title, values, cmap, is_numeric, show_colorbar, custom_colors, cb_label)
     coloring = [
-        ("Income", y_sample.values, "RdYlGn", True),
-        ("Sex", df_sample["sex"].values, None, False),
-        ("Race", df_sample["race"].values, None, False),
-        ("Age Group", df_sample["age_group"].astype(str).values, None, False),
+        ("Income",       y_labels,                               None,      False, False, income_colors, ""),
+        ("Pred. Prob.",  proba_sample,                           "RdYlGn",  True,  True,  None,          "P(>50K)"),
+        ("Sex",          df_sample["sex"].values,                None,      False, False, sex_colors,    ""),
+        ("Race",         df_sample["race"].values,               None,      False, False, race_colors,   ""),
+        ("Age",          df_sample["age"].values.astype(float),  "turbo",   True,  True,  None,          "Age"),
     ]
 
     for row, method in enumerate(methods):
         z = dim_results[method]
-        for col, (title, values, cmap, is_numeric) in enumerate(coloring):
+        for col, (title, values, cmap, is_numeric, show_colorbar, custom_colors, cb_label) in enumerate(coloring):
             ax = axes[row, col]
             ax.set_facecolor(BG)
+            ax.set_box_aspect(1)
+
             if row == 0:
                 ax.set_title(title, fontsize=11, fontweight="bold", color=C_DARK)
             ax.set_xlabel(f"{method} 1", fontsize=8)
@@ -173,17 +189,15 @@ def plot_latent_space_grid(dim_results, idx, demo_df, y_test, model_name, filena
 
             if is_numeric:
                 sc = ax.scatter(z[:, 0], z[:, 1], c=values, cmap=cmap, s=6, alpha=0.6)
-                plt.colorbar(sc, ax=ax, label=">50K", shrink=0.7)
+                if show_colorbar:
+                    plt.colorbar(sc, ax=ax, label=cb_label, fraction=0.046, pad=0.04)
             else:
-                unique_vals = sorted(set(values))
-                colors = plt.cm.tab10(np.linspace(0, 1, max(len(unique_vals), 2)))
-                for j, val in enumerate(unique_vals):
+                for val, color in custom_colors.items():
                     mask = values == val
-                    ax.scatter(z[mask, 0], z[mask, 1], c=[colors[j]], s=6,
-                               alpha=0.5, label=val)
+                    ax.scatter(z[mask, 0], z[mask, 1], c=[color], s=6,
+                               alpha=0.5, label=str(val))
                 ax.legend(fontsize=6, markerscale=2, loc="best")
 
-    plt.tight_layout(rect=[0, 0, 1, 0.95])
     path = OUTPUT_DIR / filename
     plt.savefig(path, dpi=150, bbox_inches="tight", facecolor=BG)
     plt.close()
@@ -934,10 +948,10 @@ def main():
     nn_last_hidden = nn_layers[last_layer_name]
 
     nn_dim, idx_nn = run_dim_reduction(nn_last_hidden, "NN hidden layer")
-    plot_latent_space_grid(nn_dim, idx_nn, demo_test, y_test, "Neural Network", "nn_latent_space.png")
+    plot_latent_space_grid(nn_dim, idx_nn, demo_test, y_test, nn_proba, "Neural Network", "nn_latent_space.png")
 
     xgb_dim, idx_xgb = run_dim_reduction(xgb_leaves, "XGBoost leaves")
-    plot_latent_space_grid(xgb_dim, idx_xgb, demo_test, y_test, "XGBoost", "xgb_latent_space.png")
+    plot_latent_space_grid(xgb_dim, idx_xgb, demo_test, y_test, xgb_proba, "XGBoost", "xgb_latent_space.png")
     steps.update(1)
 
     # ----------------------------------------------------------
