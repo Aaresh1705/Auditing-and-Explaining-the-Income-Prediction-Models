@@ -126,13 +126,55 @@ def run_dim_reduction(embeddings, name, sample_size=2000):
 
     return results, idx
 
-def plot_latent_space_grid(dim_results, idx, demo_df, y_test, model_proba, model_name, filename):
+def _investment_discrete(data_min, data_max):
+    """Discrete colormap and norm for investment bins (loss=red, neutral=gray, gain=green)."""
+    from matplotlib.colors import BoundaryNorm, ListedColormap
+    # Inner boundaries (fixed), outer boundaries from actual data
+    inner = [-1000, -100, -1, 1, 100, 1000, 10000]
+    # Keep only inner bounds within the data range
+    boundaries = [b for b in inner if data_min < b < data_max]
+    boundaries = [data_min] + boundaries + [data_max]
+
+    # Color per bin: red → yellow → gray → blue → green
+    # Loss side:  dark red, red, yellow (approaching neutral)
+    # Gain side:  blue (leaving neutral), green, dark green
+    all_bins = list(zip(boundaries[:-1], boundaries[1:]))
+    color_map = {
+        # loss bins (high to low magnitude)
+        (-np.inf, -1000): "#b71c1c",   # dark red:    loss > 1k
+        (-1000,   -100):  "#ef9a9a",   # light red:   loss 100–1k
+        (-100,    -1):    "#f9a825",   # yellow:      loss 1–100
+        # neutral
+        (-1,      1):     C_GRAY,      # gray:        ~$0
+        # gain bins (low to high magnitude)
+        (1,       100):   "#90caf9",   # light blue:  gain 1–100
+        (100,     1000):  "#1565c0",   # dark blue:   gain 100–1k
+        (1000,    10000): "#a5d6a7",   # light green: gain 1k–10k
+        (10000,   np.inf):"#2e7d32",   # dark green:  gain 10k+
+    }
+    colors = []
+    for lo, hi in all_bins:
+        for (clo, chi), c in color_map.items():
+            if lo >= clo and hi <= chi:
+                colors.append(c)
+                break
+        else:
+            colors.append(C_GRAY)
+
+    cmap = ListedColormap(colors)
+    norm = BoundaryNorm(boundaries, cmap.N, clip=True)
+    return cmap, norm, boundaries
+
+
+def plot_latent_space_grid(dim_results, idx, demo_df, y_test, model_proba,
+                           model_name, filename, raw_df=None):
     methods = list(dim_results.keys())
     n_methods = len(methods)
+    n_cols = 6 if raw_df is not None else 5
 
     fig, axes = plt.subplots(
-        n_methods, 5,
-        figsize=(28, 5.5 * n_methods),
+        n_methods, n_cols,
+        figsize=(5.6 * n_cols, 5.5 * n_methods),
         facecolor=BG,
         constrained_layout=True,
     )
@@ -170,9 +212,26 @@ def plot_latent_space_grid(dim_results, idx, demo_df, y_test, model_proba, model
         ("Age",          df_sample["age"].values.astype(float),  "turbo",   True,  True,  None,          "Age"),
     ]
 
+    # Investment column: discrete bins for capital-gain minus capital-loss
+    if raw_df is not None:
+        raw_sample = raw_df.iloc[idx]
+        invest_vals = (raw_sample["capital-gain"].values.astype(float)
+                       - raw_sample["capital-loss"].values.astype(float))
+        inv_cmap, inv_norm, inv_bounds = _investment_discrete(
+            invest_vals.min(), invest_vals.max())
+        coloring.append(
+            ("Investment", invest_vals, inv_cmap, True, True, None,
+             "Gain / Loss ($)", inv_norm, inv_bounds),
+        )
+
     for row, method in enumerate(methods):
         z = dim_results[method]
-        for col, (title, values, cmap, is_numeric, show_colorbar, custom_colors, cb_label) in enumerate(coloring):
+        for col, entry in enumerate(coloring):
+            # Unpack: optional 8th/9th elements for custom norm and boundaries
+            title, values, cmap, is_numeric, show_colorbar, custom_colors, cb_label = entry[:7]
+            custom_norm = entry[7] if len(entry) > 7 else None
+            custom_bounds = entry[8] if len(entry) > 8 else None
+
             ax = axes[row, col]
             ax.set_facecolor(BG)
             ax.set_box_aspect(1)
@@ -188,9 +247,24 @@ def plot_latent_space_grid(dim_results, idx, demo_df, y_test, model_proba, model
                         rotation=90, va="center", ha="center")
 
             if is_numeric:
-                sc = ax.scatter(z[:, 0], z[:, 1], c=values, cmap=cmap, s=6, alpha=0.6)
+                sc = ax.scatter(z[:, 0], z[:, 1], c=values, cmap=cmap,
+                                norm=custom_norm, s=6, alpha=0.6)
                 if show_colorbar:
-                    plt.colorbar(sc, ax=ax, label=cb_label, fraction=0.046, pad=0.04)
+                    if title == "Investment" and custom_bounds is not None:
+                        cb = plt.colorbar(sc, ax=ax, label=cb_label,
+                                          fraction=0.046, pad=0.04, spacing="uniform")
+                        cb.set_ticks(custom_bounds)
+                        def _fmt_tick(v):
+                            if abs(v) < 1:
+                                return "$0"
+                            sign = "-" if v < 0 else ""
+                            av = abs(v)
+                            if av >= 1000:
+                                return f"{sign}${av/1000:.0f}k"
+                            return f"{sign}${av:.0f}"
+                        cb.set_ticklabels([_fmt_tick(b) for b in custom_bounds])
+                    else:
+                        plt.colorbar(sc, ax=ax, label=cb_label, fraction=0.046, pad=0.04)
             else:
                 for val, color in custom_colors.items():
                     mask = values == val
@@ -200,6 +274,97 @@ def plot_latent_space_grid(dim_results, idx, demo_df, y_test, model_proba, model
 
     path = OUTPUT_DIR / filename
     plt.savefig(path, dpi=150, bbox_inches="tight", facecolor=BG)
+    plt.savefig(path.with_suffix(".pdf"), bbox_inches="tight", facecolor=BG)
+    plt.close()
+    print(f"  Saved: {path}")
+
+
+def plot_concept_latent_space(dim_results, idx, raw_df, model_name, filename):
+    """Separate latent-space figure colored by selected concepts."""
+    methods = list(dim_results.keys())
+    n_methods = len(methods)
+
+    raw_sample = raw_df.iloc[idx]
+
+    # Define concept colorings: (title, category_values, color_dict)
+    concepts = []
+
+    # 1. Near retirement (binary)
+    retire_vals = np.where(raw_sample["age"].values >= 58, "Near retirement", "Working age")
+    concepts.append(("Near Retirement", retire_vals,
+                     {"Working age": C_BLUE, "Near retirement": C_ORANGE}))
+
+    # 2. White collar (binary)
+    wc_occ = ["Exec-managerial", "Prof-specialty", "Tech-support", "Adm-clerical"]
+    wc_vals = np.where(raw_sample["occupation"].isin(wc_occ), "White collar", "Other")
+    concepts.append(("White Collar", wc_vals,
+                     {"Other": C_GRAY, "White collar": C_BLUE}))
+
+    # 3. College educated (binary)
+    college = ["Bachelors", "Masters", "Doctorate", "Prof-school", "Assoc-acdm", "Assoc-voc"]
+    edu_vals = np.where(raw_sample["education"].isin(college), "College", "No college")
+    concepts.append(("College Education", edu_vals,
+                     {"No college": C_GRAY, "College": C_PURPLE}))
+
+    # 4. Relationship: Married / Single / Other
+    ms = raw_sample["marital-status"].values
+    rel_vals = np.where(
+        np.isin(ms, ["Married-civ-spouse", "Married-AF-spouse"]), "Married",
+        np.where(ms == "Never-married", "Single", "Other"))
+    concepts.append(("Relationship", rel_vals,
+                     {"Married": C_GREEN, "Single": C_ORANGE, "Other": C_GRAY}))
+
+    # 5. Work status: Full-time / Part-time / Not working
+    hrs = raw_sample["hours-per-week"].values.astype(float)
+    wc = raw_sample["workclass"].values
+    not_working = np.isin(wc, ["Never-worked", "Without-pay", "?"])
+    work_vals = np.where(not_working, "Not working",
+                np.where(hrs >= 35, "Full-time", "Part-time"))
+    concepts.append(("Work Status", work_vals,
+                     {"Full-time": C_BLUE, "Part-time": C_ORANGE, "Not working": C_RED}))
+
+    n_concepts = len(concepts)
+
+    fig, axes = plt.subplots(
+        n_methods, n_concepts,
+        figsize=(5.6 * n_concepts, 5.5 * n_methods),
+        facecolor=BG,
+        constrained_layout=True,
+    )
+    if n_methods == 1:
+        axes = axes[np.newaxis, :]
+
+    fig.suptitle(
+        f"Latent Space: {model_name}\nInternal representations colored by concepts",
+        fontsize=14, fontweight="bold", color=C_DARK,
+    )
+
+    for row, method in enumerate(methods):
+        z = dim_results[method]
+        for col, (title, values, color_dict) in enumerate(concepts):
+            ax = axes[row, col]
+            ax.set_facecolor(BG)
+            ax.set_box_aspect(1)
+
+            if row == 0:
+                ax.set_title(title, fontsize=11, fontweight="bold", color=C_DARK)
+            ax.set_xlabel(f"{method} 1", fontsize=8)
+            ax.set_ylabel(f"{method} 2", fontsize=8)
+
+            if col == 0:
+                ax.text(-0.15, 0.5, method, transform=ax.transAxes,
+                        fontsize=12, fontweight="bold", color=C_DARK,
+                        rotation=90, va="center", ha="center")
+
+            for val, color in color_dict.items():
+                mask = values == val
+                ax.scatter(z[mask, 0], z[mask, 1], c=[color], s=6,
+                           alpha=0.5, label=str(val))
+            ax.legend(fontsize=6, markerscale=2, loc="best")
+
+    path = OUTPUT_DIR / filename
+    plt.savefig(path, dpi=150, bbox_inches="tight", facecolor=BG)
+    plt.savefig(path.with_suffix(".pdf"), bbox_inches="tight", facecolor=BG)
     plt.close()
     print(f"  Saved: {path}")
 
@@ -226,6 +391,7 @@ def concept_probe_single(embeddings, concept_mask, concept_name, n_threads):
 
     probe_scores = cross_val_score(probe, X_probe, y_probe, cv=cv, scoring="accuracy")
     baseline_scores = cross_val_score(baseline, X_probe, y_probe, cv=cv, scoring="accuracy")
+    probe_auc = cross_val_score(probe, X_probe, y_probe, cv=cv, scoring="roc_auc")
 
     return {
         "concept": concept_name,
@@ -235,6 +401,8 @@ def concept_probe_single(embeddings, concept_mask, concept_name, n_threads):
         "probe_std": probe_scores.std(),
         "baseline_mean": baseline_scores.mean(),
         "improvement": probe_scores.mean() - baseline_scores.mean(),
+        "probe_auc_mean": probe_auc.mean(),
+        "probe_auc_std": probe_auc.std(),
     }
 
 
@@ -299,14 +467,19 @@ def plot_concept_probe_heatmap(probe_df, filename):
     plt.tight_layout(rect=[0, 0, 1, 0.93])
     path = OUTPUT_DIR / filename
     plt.savefig(path, dpi=200, bbox_inches="tight", facecolor=BG)
+    plt.savefig(path.with_suffix(".pdf"), bbox_inches="tight", facecolor=BG)
     plt.close()
     print(f"  Saved: {path}")
 
 
 def plot_concept_probe_bars(probe_df, filename):
-    """Bar chart: probe accuracy vs baseline for each concept, grouped by model."""
-    # Use only the last (deepest) layer per model for the summary bar chart
-    all_concepts_list = list(get_all_concepts().keys())
+    """Bar chart: probe accuracy vs baseline for selected concepts."""
+    selected_concepts = [
+        "Female", "Racial minority", "Immigrant",
+        "White collar", "Peak career", "College educated",
+        "Near retirement", "Single / never married", "Full-time standard",
+    ]
+    all_concepts_list = [c for c in selected_concepts if c in probe_df["concept"].values]
     models = probe_df["model"].unique()
 
     fig, ax = plt.subplots(figsize=(12, 10), facecolor=BG)
@@ -328,14 +501,18 @@ def plot_concept_probe_bars(probe_df, filename):
 
         color = C_BLUE if "NN" in model else C_ORANGE
         ax.bar(x + i * w, vals, w, label=f"{model} probe", color=color, edgecolor="white")
-        ax.bar(x + i * w, baselines, w, color=C_GRAY, alpha=0.25, edgecolor="white")
+        # Draw baseline as a horizontal line per concept instead of overlaid bar
+        for j, b in enumerate(baselines):
+            if not np.isnan(b):
+                ax.plot([x[j] + i * w - w/2, x[j] + i * w + w/2], [b, b],
+                        color=C_RED, lw=2, zorder=5)
 
     ax.set_xticks(x + w / 2)
     ax.set_xticklabels(all_concepts_list, fontsize=8, rotation=45, ha="right")
     ax.set_ylabel("Accuracy", fontsize=10)
-    ax.set_title("Concept Probing: Can concepts be recovered from model representations?",
+    ax.set_title("Concept Probing: Selected Concepts",
                  fontsize=12, fontweight="bold", color=C_DARK)
-    ax.bar([], [], color=C_GRAY, alpha=0.25, label="Majority-class baseline")
+    ax.plot([], [], color=C_RED, lw=2, label="Majority-class baseline")
     ax.legend(fontsize=9)
     ax.set_facecolor(BG)
     ax.spines[["top", "right"]].set_visible(False)
@@ -343,6 +520,7 @@ def plot_concept_probe_bars(probe_df, filename):
     plt.tight_layout()
     path = OUTPUT_DIR / filename
     plt.savefig(path, dpi=200, bbox_inches="tight", facecolor=BG)
+    plt.savefig(path.with_suffix(".pdf"), bbox_inches="tight", facecolor=BG)
     plt.close()
     print(f"  Saved: {path}")
 
@@ -550,6 +728,7 @@ def plot_tcav_by_stakeholder(tcav_df, filename):
     plt.tight_layout(rect=[0, 0, 1, 0.95])
     path = OUTPUT_DIR / filename
     plt.savefig(path, dpi=200, bbox_inches="tight", facecolor=BG)
+    plt.savefig(path.with_suffix(".pdf"), bbox_inches="tight", facecolor=BG)
     plt.close()
     print(f"  Saved: {path}")
 
@@ -662,12 +841,13 @@ def plot_xgb_concept_sensitivity(xgb_sens_df, filename):
     plt.tight_layout(rect=[0, 0, 1, 0.95])
     path = OUTPUT_DIR / filename
     plt.savefig(path, dpi=200, bbox_inches="tight", facecolor=BG)
+    plt.savefig(path.with_suffix(".pdf"), bbox_inches="tight", facecolor=BG)
     plt.close()
     print(f"  Saved: {path}")
 
 
 # ============================================================
-# 6. CKA — Linear Centered Kernel Alignment
+# 6. CKA — Linear & Kernel Centered Kernel Alignment
 # ============================================================
 def linear_cka(X, Y):
     X = X - X.mean(axis=0)
@@ -678,8 +858,37 @@ def linear_cka(X, Y):
     return hsic_xy / (np.sqrt(hsic_xx * hsic_yy) + 1e-10)
 
 
+def _rbf_kernel(X, sigma=None):
+    """Compute RBF (Gaussian) kernel matrix."""
+    sq_dists = np.sum(X ** 2, axis=1, keepdims=True) \
+               - 2 * X @ X.T \
+               + np.sum(X ** 2, axis=1, keepdims=False)
+    sq_dists = np.maximum(sq_dists, 0)
+    if sigma is None:
+        # Median heuristic
+        sigma = np.sqrt(np.median(sq_dists[sq_dists > 0]))
+    return np.exp(-sq_dists / (2 * sigma ** 2 + 1e-10))
+
+
+def _center_kernel(K):
+    """Center a kernel matrix (equivalent to centering in feature space)."""
+    n = K.shape[0]
+    H = np.eye(n) - np.ones((n, n)) / n
+    return H @ K @ H
+
+
+def kernel_cka(X, Y):
+    """CKA with RBF kernels — captures nonlinear representational similarity."""
+    Kx = _center_kernel(_rbf_kernel(X))
+    Ky = _center_kernel(_rbf_kernel(Y))
+    hsic_xy = np.sum(Kx * Ky)
+    hsic_xx = np.sum(Kx * Kx)
+    hsic_yy = np.sum(Ky * Ky)
+    return hsic_xy / (np.sqrt(hsic_xx * hsic_yy) + 1e-10)
+
+
 def plot_cka_heatmap(nn_layers, xgb_leaves, filename):
-    """CKA heatmap between all representation layers."""
+    """Side-by-side CKA heatmaps: linear and kernel."""
     rng = np.random.default_rng(42)
     n = min(1000, len(xgb_leaves), min(v.shape[0] for v in nn_layers.values()))
     idx = rng.choice(min(len(xgb_leaves), min(v.shape[0] for v in nn_layers.values())),
@@ -693,34 +902,46 @@ def plot_cka_heatmap(nn_layers, xgb_leaves, filename):
 
     names = list(all_reps.keys())
     m = len(names)
-    cka_matrix = np.zeros((m, m))
 
+    linear_matrix = np.zeros((m, m))
+    kernel_matrix = np.zeros((m, m))
+    print("    Computing linear CKA...", flush=True)
     for i in range(m):
         for j in range(m):
-            cka_matrix[i, j] = linear_cka(all_reps[names[i]], all_reps[names[j]])
-
-    fig, ax = plt.subplots(figsize=(8, 6), facecolor=BG)
-    im = ax.imshow(cka_matrix, cmap="YlOrRd", vmin=0, vmax=1)
-    ax.set_xticks(range(m))
-    ax.set_yticks(range(m))
-    ax.set_xticklabels(names, rotation=45, ha="right", fontsize=10)
-    ax.set_yticklabels(names, fontsize=10)
-
+            linear_matrix[i, j] = linear_cka(all_reps[names[i]], all_reps[names[j]])
+    print("    Computing kernel CKA (RBF)...", flush=True)
     for i in range(m):
         for j in range(m):
-            ax.text(j, i, f"{cka_matrix[i, j]:.3f}", ha="center", va="center",
-                    fontsize=11, fontweight="bold",
-                    color="white" if cka_matrix[i, j] > 0.5 else C_DARK)
+            kernel_matrix[i, j] = kernel_cka(all_reps[names[i]], all_reps[names[j]])
 
-    plt.colorbar(im, ax=ax, label="Linear CKA", shrink=0.8)
-    ax.set_title("Representational Alignment (Linear CKA)\n"
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6), facecolor=BG)
+    fig.suptitle("Representational Alignment (CKA)\n"
                  "NN Hidden Layers vs XGBoost Leaf Embeddings",
-                 fontsize=13, fontweight="bold", color=C_DARK)
-    ax.set_facecolor(BG)
+                 fontsize=13, fontweight="bold", color=C_DARK, y=1.02)
 
-    plt.tight_layout()
+    for ax, matrix, label in zip(axes,
+                                  [linear_matrix, kernel_matrix],
+                                  ["Linear CKA", "Kernel CKA (RBF)"]):
+        im = ax.imshow(matrix, cmap="viridis", vmin=0, vmax=1)
+        ax.set_xticks(range(m))
+        ax.set_yticks(range(m))
+        ax.set_xticklabels(names, rotation=45, ha="right", fontsize=10)
+        ax.set_yticklabels(names, fontsize=10)
+
+        for i in range(m):
+            for j in range(m):
+                ax.text(j, i, f"{matrix[i, j]:.3f}", ha="center", va="center",
+                        fontsize=11, fontweight="bold",
+                        color="white" if matrix[i, j] > 0.5 else C_DARK)
+
+        plt.colorbar(im, ax=ax, label=label, shrink=0.8)
+        ax.set_title(label, fontsize=12, fontweight="bold", color=C_DARK)
+        ax.set_facecolor(BG)
+
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
     path = OUTPUT_DIR / filename
     plt.savefig(path, dpi=200, bbox_inches="tight", facecolor=BG)
+    plt.savefig(path.with_suffix(".pdf"), bbox_inches="tight", facecolor=BG)
     plt.close()
     print(f"  Saved: {path}")
 
@@ -728,16 +949,21 @@ def plot_cka_heatmap(nn_layers, xgb_leaves, filename):
 # ============================================================
 # 7. Fairness metrics
 # ============================================================
-def compute_fairness_metrics(y_true, y_pred, sensitive_attr, attr_name):
+def compute_fairness_metrics(y_true, y_pred, y_proba, sensitive_attr, attr_name):
     groups = sorted(set(sensitive_attr))
     rows = []
     for g in groups:
         mask = sensitive_attr == g
         yt = y_true[mask]
         yp = y_pred[mask]
+        ypr = y_proba[mask]
         n = mask.sum()
         approval_rate = yp.mean()
         accuracy = accuracy_score(yt, yp)
+        if len(np.unique(yt)) > 1:
+            auc = roc_auc_score(yt, ypr)
+        else:
+            auc = np.nan
         pos_mask = yt == 1
         tpr = yp[pos_mask].mean() if pos_mask.sum() > 0 else np.nan
         neg_mask = yt == 0
@@ -745,7 +971,7 @@ def compute_fairness_metrics(y_true, y_pred, sensitive_attr, attr_name):
         rows.append({
             "attribute": attr_name, "group": g, "n_samples": n,
             "approval_rate": approval_rate, "accuracy": accuracy,
-            "tpr": tpr, "fpr": fpr,
+            "roc_auc": auc, "tpr": tpr, "fpr": fpr,
         })
 
     df = pd.DataFrame(rows)
@@ -760,55 +986,101 @@ def compute_fairness_metrics(y_true, y_pred, sensitive_attr, attr_name):
     return df
 
 
-def run_fairness_analysis(y_test, xgb_pred, nn_pred, demo_test):
+def run_fairness_analysis(y_test, xgb_pred, nn_pred, xgb_proba, nn_proba, demo_test):
     all_results = []
     for attr in ["sex", "race"]:
         attr_vals = demo_test[attr].values
-        for model_name, preds in [("XGBoost", xgb_pred), ("NN", nn_pred)]:
-            df_fair = compute_fairness_metrics(y_test.values, preds, attr_vals, attr)
+        for model_name, preds, proba in [("XGBoost", xgb_pred, xgb_proba),
+                                          ("NN", nn_pred, nn_proba)]:
+            df_fair = compute_fairness_metrics(y_test.values, preds, proba, attr_vals, attr)
             df_fair["model"] = model_name
             all_results.append(df_fair)
     return pd.concat(all_results, ignore_index=True)
 
 
 def plot_fairness(fairness_df, filename):
-    fig, axes = plt.subplots(1, 2, figsize=(14, 7), facecolor=BG)
+    fig, axes = plt.subplots(2, 2, figsize=(14, 12), facecolor=BG)
     fig.suptitle("Fairness Audit: Demographic Parity & Equalized Odds",
                  fontsize=14, fontweight="bold", color=C_DARK, y=0.98)
 
-    for ax, attr in zip(axes, ["sex", "race"]):
+    for col_i, attr in enumerate(["sex", "race"]):
         df_attr = fairness_df[fairness_df["attribute"] == attr]
         groups = df_attr["group"].unique()
         x = np.arange(len(groups))
         w = 0.35
+
+        # --- Top row: Approval Rate (Demographic Parity) ---
+        ax_top = axes[0, col_i]
 
         xgb_rates = [df_attr[(df_attr["group"] == g) & (df_attr["model"] == "XGBoost")]["approval_rate"].values[0]
                       for g in groups]
         nn_rates = [df_attr[(df_attr["group"] == g) & (df_attr["model"] == "NN")]["approval_rate"].values[0]
                      for g in groups]
 
-        b1 = ax.bar(x - w/2, xgb_rates, w, label="XGBoost", color=C_ORANGE, edgecolor="white")
-        b2 = ax.bar(x + w/2, nn_rates, w, label="Neural Network", color=C_BLUE, edgecolor="white")
+        b1 = ax_top.bar(x - w/2, xgb_rates, w, label="XGBoost", color=C_ORANGE, edgecolor="white")
+        b2 = ax_top.bar(x + w/2, nn_rates, w, label="Neural Network", color=C_BLUE, edgecolor="white")
 
-        max_rate = max(max(xgb_rates), max(nn_rates))
-        ax.axhline(max_rate * 0.8, color=C_RED, ls="--", lw=1.5, alpha=0.7, label="80% rule threshold")
+        xgb_threshold = max(xgb_rates) * 0.8
+        nn_threshold = max(nn_rates) * 0.8
+        ax_top.axhline(xgb_threshold, color=C_RED, ls="--", lw=1.5, alpha=0.7, label="XGBoost 80% rule")
+        ax_top.axhline(nn_threshold, color=C_PURPLE, ls="--", lw=1.5, alpha=0.7, label="NN 80% rule")
 
-        ax.set_xticks(x)
-        ax.set_xticklabels(groups, fontsize=9, rotation=30, ha="right")
-        ax.set_ylabel("Approval Rate", fontsize=10)
-        ax.set_title(f"Approval Rate by {attr.title()}", fontsize=12, fontweight="bold")
-        ax.legend(fontsize=8)
-        ax.set_facecolor(BG)
-        ax.spines[["top", "right"]].set_visible(False)
+        ax_top.set_xticks(x)
+        ax_top.set_xticklabels(groups, fontsize=9, rotation=30, ha="right")
+        ax_top.set_ylabel("Approval Rate", fontsize=10)
+        ax_top.set_title(f"Approval Rate by {attr.title()}", fontsize=12, fontweight="bold")
+        ax_top.legend(fontsize=8)
+        ax_top.set_facecolor(BG)
+        ax_top.spines[["top", "right"]].set_visible(False)
 
         for bars in [b1, b2]:
             for bar in bars:
-                ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.005,
-                        f"{bar.get_height():.1%}", ha="center", fontsize=7)
+                ax_top.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.005,
+                            f"{bar.get_height():.1%}", ha="center", fontsize=7)
+
+        # --- Bottom row: ROC-AUC per group (Equalized Odds) ---
+        ax_bot = axes[1, col_i]
+
+        xgb_aucs = [df_attr[(df_attr["group"] == g) & (df_attr["model"] == "XGBoost")]["roc_auc"].values[0]
+                     for g in groups]
+        nn_aucs = [df_attr[(df_attr["group"] == g) & (df_attr["model"] == "NN")]["roc_auc"].values[0]
+                    for g in groups]
+
+        b3 = ax_bot.bar(x - w/2, xgb_aucs, w, label="XGBoost", color=C_ORANGE, edgecolor="white")
+        b4 = ax_bot.bar(x + w/2, nn_aucs, w, label="Neural Network", color=C_BLUE, edgecolor="white")
+
+        xgb_aucs_valid = [a for a in xgb_aucs if not np.isnan(a)]
+        nn_aucs_valid = [a for a in nn_aucs if not np.isnan(a)]
+        if xgb_aucs_valid:
+            ax_bot.axhline(max(xgb_aucs_valid) * 0.8, color=C_RED, ls="--", lw=1.5, alpha=0.7, label="XGBoost 80% rule")
+        if nn_aucs_valid:
+            ax_bot.axhline(max(nn_aucs_valid) * 0.8, color=C_PURPLE, ls="--", lw=1.5, alpha=0.7, label="NN 80% rule")
+
+        ax_bot.set_xticks(x)
+        ax_bot.set_xticklabels(groups, fontsize=9, rotation=30, ha="right")
+        ax_bot.set_ylabel("ROC-AUC", fontsize=10)
+        ax_bot.set_title(f"ROC-AUC by {attr.title()}", fontsize=12, fontweight="bold")
+        ax_bot.legend(fontsize=8)
+        ax_bot.set_facecolor(BG)
+        ax_bot.spines[["top", "right"]].set_visible(False)
+
+        # Start y-axis from a sensible floor so differences are visible
+        all_aucs = [a for a in xgb_aucs + nn_aucs if not np.isnan(a)]
+        if all_aucs:
+            y_floor = max(0.5, min(all_aucs) - 0.05)
+            ax_bot.set_ylim(y_floor, 1.0)
+
+        for bars in [b3, b4]:
+            for bar in bars:
+                h = bar.get_height()
+                if not np.isnan(h):
+                    ax_bot.text(bar.get_x() + bar.get_width()/2, h + 0.003,
+                                f"{h:.3f}", ha="center", fontsize=7)
 
     plt.tight_layout(rect=[0, 0, 1, 0.95])
     path = OUTPUT_DIR / filename
     plt.savefig(path, dpi=200, bbox_inches="tight", facecolor=BG)
+    plt.savefig(path.with_suffix(".pdf"), bbox_inches="tight", facecolor=BG)
     plt.close()
     print(f"  Saved: {path}")
 
@@ -816,7 +1088,7 @@ def plot_fairness(fairness_df, filename):
 # ============================================================
 # 8. Proxy feature analysis
 # ============================================================
-def proxy_analysis(X_raw):
+def proxy_analysis(X_raw, drop_fnlwgt=False):
     from scipy.stats import chi2_contingency
 
     df = X_raw.copy()
@@ -825,8 +1097,10 @@ def proxy_analysis(X_raw):
     le_race = LabelEncoder()
     df["race_encoded"] = le_race.fit_transform(df["race"])
 
-    numeric_features = ["age", "fnlwgt", "education-num",
+    numeric_features = ["age", "education-num",
                         "capital-gain", "capital-loss", "hours-per-week"]
+    if not drop_fnlwgt:
+        numeric_features.insert(1, "fnlwgt")
     categorical_features = ["marital-status", "relationship", "occupation", "workclass"]
 
     proxy_results = []
@@ -879,6 +1153,7 @@ def plot_proxy_analysis(proxy_df, filename):
     plt.tight_layout(rect=[0, 0, 1, 0.93])
     path = OUTPUT_DIR / filename
     plt.savefig(path, dpi=200, bbox_inches="tight", facecolor=BG)
+    plt.savefig(path.with_suffix(".pdf"), bbox_inches="tight", facecolor=BG)
     plt.close()
     print(f"  Saved: {path}")
 
@@ -948,10 +1223,13 @@ def main():
     nn_last_hidden = nn_layers[last_layer_name]
 
     nn_dim, idx_nn = run_dim_reduction(nn_last_hidden, "NN hidden layer")
-    plot_latent_space_grid(nn_dim, idx_nn, demo_test, y_test, nn_proba, "Neural Network", "nn_latent_space.png")
+    plot_latent_space_grid(nn_dim, idx_nn, demo_test, y_test, nn_proba, "Neural Network", "nn_latent_space.png", raw_df=raw_test)
 
     xgb_dim, idx_xgb = run_dim_reduction(xgb_leaves, "XGBoost leaves")
-    plot_latent_space_grid(xgb_dim, idx_xgb, demo_test, y_test, xgb_proba, "XGBoost", "xgb_latent_space.png")
+    plot_latent_space_grid(xgb_dim, idx_xgb, demo_test, y_test, xgb_proba, "XGBoost", "xgb_latent_space.png", raw_df=raw_test)
+
+    plot_concept_latent_space(nn_dim, idx_nn, raw_test, "Neural Network", "nn_concept_latent_space.png")
+    plot_concept_latent_space(xgb_dim, idx_xgb, raw_test, "XGBoost", "xgb_concept_latent_space.png")
     steps.update(1)
 
     # ----------------------------------------------------------
@@ -1017,11 +1295,11 @@ def main():
     # ----------------------------------------------------------
     steps.set_description("[9/9] Computing fairness metrics & proxy analysis")
 
-    fairness_df = run_fairness_analysis(y_test, xgb_pred, nn_pred, demo_test)
+    fairness_df = run_fairness_analysis(y_test, xgb_pred, nn_pred, xgb_proba, nn_proba, demo_test)
     fairness_df.to_csv(OUTPUT_DIR / "fairness_metrics.csv", index=False)
     plot_fairness(fairness_df, "fairness_audit.png")
 
-    proxy_df = proxy_analysis(data["X_raw"])
+    proxy_df = proxy_analysis(data["X_raw"], drop_fnlwgt=drop_fnlwgt)
     proxy_df.to_csv(OUTPUT_DIR / "proxy_analysis.csv", index=False)
     plot_proxy_analysis(proxy_df, "proxy_analysis.png")
 
@@ -1063,8 +1341,11 @@ def main():
             df_sub = fairness_df[(fairness_df["attribute"] == attr) & (fairness_df["model"] == model)]
             di = df_sub["disparate_impact_ratio"].iloc[0]
             eo = df_sub["equalized_odds_gap"].iloc[0]
+            aucs = df_sub[["group", "roc_auc"]].set_index("group")["roc_auc"]
+            auc_str = ", ".join(f"{g}: {v:.3f}" for g, v in aucs.items() if not np.isnan(v))
             print(f"  {model:8s} | {attr:4s} | DI: {di:.3f} "
-                  f"{'(PASS)' if di >= 0.8 else '(FAIL < 0.8)'} | EO gap: {eo:.3f}")
+                  f"{'(PASS)' if di >= 0.8 else '(FAIL < 0.8)'} | EO gap: {eo:.3f} | "
+                  f"AUC [{auc_str}]")
 
     print(f"\nAll outputs saved to: {OUTPUT_DIR}")
     print("=" * 60)
