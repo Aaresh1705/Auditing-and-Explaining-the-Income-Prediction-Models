@@ -40,6 +40,7 @@ from sklearn.preprocessing import StandardScaler
 
 import xgboost as xgb
 import tensorflow as tf
+import lime.lime_tabular
 
 tf.config.threading.set_intra_op_parallelism_threads(int(N_THREADS))
 tf.config.threading.set_inter_op_parallelism_threads(2)
@@ -153,6 +154,77 @@ def get_probe_scores(stakeholder, model_name, probe_df):
     return concepts, np.array(scores)
 
 
+# Mapping from Loan Applicant concepts to the raw feature prefixes they depend on.
+# After one-hot encoding, any column starting with these prefixes belongs to the concept.
+CONCEPT_FEATURE_MAP = {
+    "College educated": ["education"],
+    "Full-time standard": ["hours-per-week"],
+    "White collar occupation": ["occupation"],
+    "Has investment activity": ["capital-gain", "capital-loss"],
+    "Peak career": ["age", "hours-per-week", "education-num"],
+    "Single / never married": ["marital-status"],
+}
+
+
+def explain_applicant_lime(model_name, data, xgb_model, nn_model, X_test_xgb,
+                           app_idx):
+    """
+    Run LIME on a single applicant and aggregate feature contributions by concept.
+
+    Returns dict: concept_name -> summed LIME contribution (positive = toward approval).
+    """
+    feature_names = data["feature_names"]
+
+    if model_name == "XGBoost":
+        training_data = data["X_train"].values
+        instance = X_test_xgb.iloc[app_idx].values
+        predict_fn = lambda x: xgb_model.predict_proba(
+            pd.DataFrame(x, columns=feature_names)
+            .reindex(columns=xgb_model.get_booster().feature_names, fill_value=0)
+        )
+    else:  # NN
+        training_data = data["X_train_scaled"]
+        instance = data["X_test_scaled"][app_idx]
+        def predict_fn(x):
+            p = nn_model.predict(x, verbose=0).ravel()
+            return np.column_stack([1 - p, p])
+
+    explainer = lime.lime_tabular.LimeTabularExplainer(
+        training_data,
+        feature_names=feature_names,
+        class_names=["<=50K", ">50K"],
+        mode="classification",
+        random_state=42,
+    )
+
+    explanation = explainer.explain_instance(
+        instance, predict_fn, num_features=len(feature_names), labels=(1,),
+    )
+
+    # Get contributions for class 1 (>50K = approval)
+    contrib_map = dict(explanation.as_list(label=1))
+
+    # Map feature contributions to concepts
+    # contrib_map keys are like "education_Bachelors > 0.50" — extract the feature name
+    feature_contribs = {}
+    for desc, weight in contrib_map.items():
+        # LIME descriptions look like "feature_name <= 0.12" or "0.5 < feature_name <= 1.0"
+        for fname in feature_names:
+            if fname in desc:
+                feature_contribs[fname] = feature_contribs.get(fname, 0) + weight
+                break
+
+    concept_scores = {}
+    for concept_name, prefixes in CONCEPT_FEATURE_MAP.items():
+        total = 0.0
+        for fname, w in feature_contribs.items():
+            if any(fname == p or fname.startswith(p + "_") for p in prefixes):
+                total += w
+        concept_scores[concept_name] = total
+
+    return concept_scores
+
+
 # ============================================================
 # 1. Head of Data Science Dashboard
 # ============================================================
@@ -201,7 +273,7 @@ def dashboard_data_scientist(model_name, accent_col, data, model_pred, model_pro
                      f"Concept Influence ({score_type})", accent_col)
 
     # --- Panel 3: Concept probe heatmap (this model only) ---
-    ax_probe = fig.add_subplot(gs[1, :])
+    ax_probe = fig.add_subplot(gs[1, 0])
     if not probe_df.empty:
         model_key = model_name if model_name == "NN" else "XGBoost"
         df_m = probe_df[probe_df["model"] == model_key]
@@ -229,28 +301,89 @@ def dashboard_data_scientist(model_name, accent_col, data, model_pred, model_pro
                        fontsize=12, fontweight="bold", color=C_DARK, pad=10)
     ax_probe.set_facecolor(BG)
 
-    # --- Panel 4: Fairness ---
+    # --- Panel 3b: ROC-AUC per demographic group ---
+    ax_roc = fig.add_subplot(gs[1, 1])
+    if not fairness_df.empty:
+        model_key = model_name if model_name == "NN" else "XGBoost"
+        df_f = fairness_df[fairness_df["model"] == model_key]
+        if not df_f.empty:
+            all_groups = []
+            all_aucs = []
+            all_colors = []
+            attr_labels = []
+            for attr, col in [("sex", C_BLUE), ("race", C_ORANGE)]:
+                df_attr = df_f[df_f["attribute"] == attr]
+                for _, row in df_attr.iterrows():
+                    all_groups.append(row["group"])
+                    all_aucs.append(row["roc_auc"])
+                    all_colors.append(col)
+                    attr_labels.append(attr)
+
+            x = np.arange(len(all_groups))
+            ax_roc.bar(x, all_aucs, color=all_colors, edgecolor="white")
+
+            # 80% rule line based on max AUC
+            valid_aucs = [a for a in all_aucs if not np.isnan(a)]
+            if valid_aucs:
+                ax_roc.axhline(max(valid_aucs) * 0.8, color=C_RED, ls="--", lw=1.5,
+                               alpha=0.7, label="80% rule threshold")
+                y_floor = max(0.5, min(valid_aucs) - 0.05)
+                ax_roc.set_ylim(y_floor, 1.0)
+
+            ax_roc.set_xticks(x)
+            ax_roc.set_xticklabels(all_groups, fontsize=8, rotation=30, ha="right")
+            ax_roc.set_ylabel("ROC-AUC", fontsize=10)
+
+            # Add value labels on bars
+            for i, a in enumerate(all_aucs):
+                if not np.isnan(a):
+                    ax_roc.text(i, a + 0.003, f"{a:.3f}", ha="center", fontsize=7)
+
+            # Legend for attribute colours
+            sex_patch = mpatches.Patch(color=C_BLUE, label="Sex")
+            race_patch = mpatches.Patch(color=C_ORANGE, label="Race")
+            ax_roc.legend(handles=[sex_patch, race_patch,
+                          plt.Line2D([], [], color=C_RED, ls="--", label="80% rule")],
+                          fontsize=8)
+
+    ax_roc.set_title(f"Demographic Parity: ROC-AUC — {model_name}",
+                     fontsize=11, fontweight="bold", color=C_DARK, pad=10)
+    ax_roc.set_facecolor(BG)
+    ax_roc.spines[["top", "right"]].set_visible(False)
+
+    # --- Panel 4: Fairness — Approval rates by demographic group ---
     ax_fair = fig.add_subplot(gs[2, 0])
     if not fairness_df.empty:
         model_key = model_name if model_name == "NN" else "XGBoost"
         df_f = fairness_df[fairness_df["model"] == model_key]
         if not df_f.empty:
-            groups = df_f["group"].values
-            rates = df_f["approval_rate"].values
-            x = np.arange(len(groups))
-            colors = [accent_col] * len(groups)
-            ax_fair.bar(x, rates, color=colors, edgecolor="white")
-            max_rate = rates.max() if rates.max() > 0 else 1
-            ax_fair.axhline(max_rate * 0.8, color=C_RED, ls="--", lw=1.5,
-                            label="80% rule threshold")
-            ax_fair.set_xticks(x)
-            ax_fair.set_xticklabels(groups, fontsize=8, rotation=30, ha="right")
-            ax_fair.set_ylabel("Approval Rate")
-            ax_fair.legend(fontsize=8)
-            for i, r in enumerate(rates):
-                ax_fair.text(i, r + 0.005, f"{r:.1%}", ha="center", fontsize=8)
+            all_groups = []
+            all_rates = []
+            all_colors = []
+            for attr, col in [("sex", C_BLUE), ("race", C_ORANGE)]:
+                df_attr = df_f[df_f["attribute"] == attr]
+                for _, row in df_attr.iterrows():
+                    all_groups.append(row["group"])
+                    all_rates.append(row["approval_rate"])
+                    all_colors.append(col)
 
-    ax_fair.set_title(f"Fairness: Approval Rates — {model_name}",
+            x = np.arange(len(all_groups))
+            ax_fair.bar(x, all_rates, color=all_colors, edgecolor="white")
+            max_rate = max(all_rates) if all_rates else 1
+            ax_fair.axhline(max_rate * 0.8, color=C_RED, ls="--", lw=1.5, alpha=0.7)
+            ax_fair.set_xticks(x)
+            ax_fair.set_xticklabels(all_groups, fontsize=8, rotation=30, ha="right")
+            ax_fair.set_ylabel("Approval Rate", fontsize=10)
+            for i, r in enumerate(all_rates):
+                ax_fair.text(i, r + 0.005, f"{r:.1%}", ha="center", fontsize=7)
+
+            sex_patch = mpatches.Patch(color=C_BLUE, label="Sex")
+            race_patch = mpatches.Patch(color=C_ORANGE, label="Race")
+            ax_fair.legend(handles=[sex_patch, race_patch,
+                           plt.Line2D([], [], color=C_RED, ls="--", label="80% rule")],
+                           fontsize=8)
+
+    ax_fair.set_title(f"Demographic Parity: Approval Rates — {model_name}",
                       fontsize=11, fontweight="bold", color=C_DARK, pad=10)
     ax_fair.set_facecolor(BG)
     ax_fair.spines[["top", "right"]].set_visible(False)
@@ -335,7 +468,8 @@ def dashboard_director(model_name, accent_col, data, model_pred, model_proba,
     model_key = model_name if model_name == "NN" else "XGBoost"
     all_pass = True
     if not fairness_df.empty:
-        y_pos = 0.82
+        y_pos = 0.85
+        # --- Approval rate parity (sex & race) ---
         for attr in ["sex", "race"]:
             df_sub = fairness_df[(fairness_df["attribute"] == attr) &
                                  (fairness_df["model"] == model_key)]
@@ -352,11 +486,10 @@ def dashboard_director(model_name, accent_col, data, model_pred, model_proba,
             edge_col = status_col + "55"
 
             ax_fair.add_patch(mpatches.FancyBboxPatch(
-                (0.04, y_pos - 0.15), 0.92, 0.14, boxstyle="round,pad=0.018",
+                (0.04, y_pos - 0.16), 0.92, 0.15, boxstyle="round,pad=0.018",
                 facecolor=bg_col, edgecolor=edge_col, linewidth=1.5,
                 transform=ax_fair.transAxes, clip_on=False))
 
-            # Explain in plain language
             if attr == "sex":
                 explanation = f"Men and women are treated equally: {di:.0%} fairness ratio"
                 if not passes:
@@ -367,46 +500,76 @@ def dashboard_director(model_name, accent_col, data, model_pred, model_proba,
                     explanation = f"Racial groups receive different outcomes: {di:.0%} fairness ratio"
 
             ax_fair.text(0.08, y_pos - 0.05, explanation,
-                         transform=ax_fair.transAxes, fontsize=10, color=C_DARK)
-            ax_fair.text(0.88, y_pos - 0.05, status,
-                         transform=ax_fair.transAxes, fontsize=10,
-                         fontweight="bold", color=status_col, ha="right")
+                         transform=ax_fair.transAxes, fontsize=9, color=C_DARK)
+            ax_fair.text(0.08, y_pos - 0.11, status,
+                         transform=ax_fair.transAxes, fontsize=9,
+                         fontweight="bold", color=status_col)
+            y_pos -= 0.20
+
+        # --- Accuracy parity across demographics ---
+        df_model = fairness_df[fairness_df["model"] == model_key]
+        if not df_model.empty:
+            accs = df_model["accuracy"].values
+            acc_gap = accs.max() - accs.min()
+            acc_passes = acc_gap < 0.05  # less than 5pp gap
+            if not acc_passes:
+                all_pass = False
+
+            status = "FAIR" if acc_passes else "NEEDS ATTENTION"
+            status_col = C_GREEN if acc_passes else C_RED
+            bg_col = status_col + "12"
+            edge_col = status_col + "55"
+
+            ax_fair.add_patch(mpatches.FancyBboxPatch(
+                (0.04, y_pos - 0.16), 0.92, 0.15, boxstyle="round,pad=0.018",
+                facecolor=bg_col, edgecolor=edge_col, linewidth=1.5,
+                transform=ax_fair.transAxes, clip_on=False))
+
+            explanation = f"Accuracy consistent across groups: {acc_gap:.1%} gap"
+            if not acc_passes:
+                explanation = f"Accuracy varies across groups: {acc_gap:.1%} gap"
+
+            ax_fair.text(0.08, y_pos - 0.05, explanation,
+                         transform=ax_fair.transAxes, fontsize=9, color=C_DARK)
+            ax_fair.text(0.08, y_pos - 0.11, status,
+                         transform=ax_fair.transAxes, fontsize=9,
+                         fontweight="bold", color=status_col)
             y_pos -= 0.20
 
         # Overall verdict
         verdict_col = C_GREEN if all_pass else C_RED
         verdict_text = "LOW RISK" if all_pass else "HIGH RISK"
         ax_fair.add_patch(mpatches.FancyBboxPatch(
-            (0.15, 0.1), 0.7, 0.15, boxstyle="round,pad=0.02",
+            (0.15, 0.02), 0.7, 0.13, boxstyle="round,pad=0.02",
             facecolor=verdict_col + "18", edgecolor=verdict_col,
             linewidth=2.5, transform=ax_fair.transAxes, clip_on=False))
-        ax_fair.text(0.5, 0.175, f"Fairness Risk Level: {verdict_text}",
-                     transform=ax_fair.transAxes, fontsize=12,
+        ax_fair.text(0.5, 0.085, f"Fairness Risk Level: {verdict_text}",
+                     transform=ax_fair.transAxes, fontsize=11,
                      fontweight="bold", color=verdict_col, ha="center")
 
     # --- Panel 3: Concept influence (the whole point!) ---
     ax_concept = fig.add_subplot(gs[1, :])
     concepts, scores = get_concept_scores("Company Director", model_name,
                                           tcav_df, xgb_sens_df)
+    # Re-center around 0: positive = pushes toward approval, negative = against
+    centered_scores = np.array([s - 0.5 if not np.isnan(s) else 0.0 for s in scores])
     y = np.arange(len(concepts))
     bar_colors = []
-    for s in scores:
-        if np.isnan(s):
-            bar_colors.append(C_GRAY)
-        elif s > 0.6:
+    for s in centered_scores:
+        if s > 0.1:
             bar_colors.append(C_GREEN)
-        elif s < 0.4:
+        elif s < -0.1:
             bar_colors.append(C_RED)
         else:
             bar_colors.append(accent_col)
 
-    ax_concept.barh(y, scores, color=bar_colors, edgecolor="white", height=0.55)
-    ax_concept.axvline(0.5, color=C_GRAY, ls="--", lw=1.5, alpha=0.7)
+    ax_concept.barh(y, centered_scores, color=bar_colors, edgecolor="white", height=0.55)
+    ax_concept.axvline(0, color=C_GRAY, ls="--", lw=1.5, alpha=0.7)
     ax_concept.set_yticks(y)
     ax_concept.set_yticklabels(concepts, fontsize=11)
-    ax_concept.set_xlim(0, 1)
-    ax_concept.set_xlabel("Concept Influence Score\n"
-                          "(> 0.5 = pushes toward approval, < 0.5 = pushes toward rejection)",
+    ax_concept.set_xlim(-0.5, 0.5)
+    ax_concept.set_xlabel("Pushes against approval                                "
+                          "                                Pushes toward approval",
                           fontsize=9)
     ax_concept.set_title("How Much Do These Concepts Influence AI Decisions?",
                          fontsize=13, fontweight="bold", color=C_DARK, pad=12)
@@ -414,16 +577,20 @@ def dashboard_director(model_name, accent_col, data, model_pred, model_proba,
     ax_concept.spines[["top", "right"]].set_visible(False)
 
     # Annotations with plain language
-    for i, (c, s) in enumerate(zip(concepts, scores)):
-        if not np.isnan(s):
-            if s > 0.6:
-                note = "Strongly pushes toward approval"
-            elif s < 0.4:
-                note = "Works against approval"
-            else:
-                note = "Modest influence"
-            ax_concept.text(max(s + 0.03, 0.03), i, f"{s:.2f} — {note}",
+    for i, (c, s) in enumerate(zip(concepts, centered_scores)):
+        if s > 0.1:
+            note = "Favours approval"
+        elif s < -0.1:
+            note = "Works against approval"
+        else:
+            note = "Modest influence"
+        # Place label on the extending end of the bar
+        if s >= 0:
+            ax_concept.text(s + 0.02, i, note,
                             va="center", fontsize=9, color=C_DARK)
+        else:
+            ax_concept.text(s - 0.02, i, note,
+                            va="center", fontsize=9, color=C_DARK, ha="right")
 
     # --- Panel 4: Deployment recommendation ---
     ax_deploy = fig.add_subplot(gs[2, :])
@@ -431,13 +598,13 @@ def dashboard_director(model_name, accent_col, data, model_pred, model_proba,
 
     # Main recommendation box
     ax_deploy.add_patch(mpatches.FancyBboxPatch(
-        (0.05, 0.35), 0.9, 0.6, boxstyle="round,pad=0.025",
+        (0.05, 0.15), 0.9, 0.8, boxstyle="round,pad=0.025",
         facecolor=C_ORANGE + "15", edgecolor=C_ORANGE, linewidth=2.5,
         transform=ax_deploy.transAxes, clip_on=False))
-    ax_deploy.text(0.5, 0.82, "RECOMMENDATION: CONDITIONAL DEPLOYMENT",
+    ax_deploy.text(0.5, 0.85, "RECOMMENDATION: CONDITIONAL DEPLOYMENT",
                    transform=ax_deploy.transAxes, fontsize=14,
                    fontweight="bold", color=C_ORANGE, ha="center")
-    ax_deploy.text(0.5, 0.72, "This model can be deployed, but only with the following safeguards in place:",
+    ax_deploy.text(0.5, 0.76, "This model can be deployed, but only with the following safeguards in place:",
                    transform=ax_deploy.transAxes, fontsize=11,
                    color=C_DARK, ha="center")
 
@@ -448,16 +615,16 @@ def dashboard_director(model_name, accent_col, data, model_pred, model_proba,
         "Clear appeal mechanism for rejected applicants",
         "Investigate and mitigate proxy feature reliance (relationship, marital status)",
     ]
-    y_pos = 0.60
+    y_pos = 0.66
     for i, cond in enumerate(conditions):
         ax_deploy.text(0.12, y_pos, f"{i+1}.", transform=ax_deploy.transAxes,
                        fontsize=10, fontweight="bold", color=accent_col)
         ax_deploy.text(0.16, y_pos, cond, transform=ax_deploy.transAxes,
                        fontsize=10, color=C_DARK)
-        y_pos -= 0.07
+        y_pos -= 0.09
 
     # Risk note at bottom
-    ax_deploy.text(0.5, 0.15,
+    ax_deploy.text(0.5, 0.20,
                    f"Note: This model currently FAILS the 80% fairness rule for both sex and race.",
                    transform=ax_deploy.transAxes, fontsize=10,
                    color=C_RED, ha="center", fontweight="bold")
@@ -473,21 +640,26 @@ def dashboard_director(model_name, accent_col, data, model_pred, model_proba,
 # 3. Loan Applicant Dashboard
 # ============================================================
 def dashboard_applicant(model_name, accent_col, data, model_pred, model_proba,
-                        y_test, demo_test, raw_test):
+                        y_test, demo_test, raw_test, xgb_model, nn_model,
+                        X_test_xgb):
     """
-    Applicant dashboard using concept-based explanations.
-    Shows which concepts helped/hurt their application, not raw features.
+    Applicant dashboard using LIME-based local concept explanations.
+    Shows which concepts helped/hurt their specific application.
     """
-    tcav_df = load_audit_csv("tcav_results.csv")
-    xgb_sens_df = load_audit_csv("xgb_concept_sensitivity.csv")
-
-    # Pick an applicant near the decision boundary
-    uncertain_mask = (model_proba >= 0.30) & (model_proba <= 0.45)
-    if uncertain_mask.any():
-        uncertain_idxs = np.where(uncertain_mask)[0]
-        app_idx = uncertain_idxs[np.argmin(np.abs(model_proba[uncertain_idxs] - 0.40))]
+    # Pick an approved applicant with moderate capital gains (0 < gain < 10000)
+    cap_gains = raw_test["capital-gain"].values
+    approved_mask = (model_proba >= 0.70) & (cap_gains > 0) & (cap_gains < 10000)
+    if approved_mask.any():
+        approved_idxs = np.where(approved_mask)[0]
+        # Pick the one closest to 80% probability
+        app_idx = approved_idxs[np.argmin(np.abs(model_proba[approved_idxs] - 0.80))]
     else:
-        app_idx = int(np.argmin(np.abs(model_proba - 0.40)))
+        # Fallback: highest proba with any capital gain
+        gain_mask = (cap_gains > 0) & (cap_gains < 10000)
+        if gain_mask.any():
+            app_idx = np.where(gain_mask)[0][np.argmax(model_proba[gain_mask])]
+        else:
+            app_idx = int(np.argmax(model_proba))
 
     app_proba = model_proba[app_idx]
     app_pred = model_pred[app_idx]
@@ -505,9 +677,12 @@ def dashboard_applicant(model_name, accent_col, data, model_pred, model_proba,
         except Exception:
             concept_status[name] = None
 
-    # Get concept influence scores
-    concepts_list, scores = get_concept_scores("Loan Applicant", model_name,
-                                               tcav_df, xgb_sens_df)
+    # Get local concept scores via LIME
+    print(f"    Running LIME explanation for applicant {app_idx}...")
+    lime_scores = explain_applicant_lime(model_name, data, xgb_model, nn_model,
+                                         X_test_xgb, app_idx)
+    concepts_list = list(STAKEHOLDER_CONCEPTS["Loan Applicant"].keys())
+    scores = np.array([lime_scores.get(c, 0.0) for c in concepts_list])
 
     fig = plt.figure(figsize=(16, 18), facecolor=BG)
     fig.suptitle(f"Your Loan Application Result — {model_name}",
@@ -520,14 +695,14 @@ def dashboard_applicant(model_name, accent_col, data, model_pred, model_proba,
     ax_decision = fig.add_subplot(gs[0, 0])
     ax_decision.axis("off")
     ax_decision.add_patch(mpatches.FancyBboxPatch(
-        (0.05, 0.25), 0.9, 0.6, boxstyle="round,pad=0.03",
+        (0.05, 0.15), 0.9, 0.7, boxstyle="round,pad=0.03",
         facecolor=pred_color + "18", edgecolor=pred_color, linewidth=3,
         transform=ax_decision.transAxes, clip_on=False))
-    ax_decision.text(0.5, 0.65, f"APPLICATION", transform=ax_decision.transAxes,
+    ax_decision.text(0.5, 0.68, f"APPLICATION", transform=ax_decision.transAxes,
                      fontsize=14, color=C_DARK, ha="center")
-    ax_decision.text(0.5, 0.48, pred_label, transform=ax_decision.transAxes,
+    ax_decision.text(0.5, 0.52, pred_label, transform=ax_decision.transAxes,
                      fontsize=24, fontweight="black", color=pred_color, ha="center")
-    ax_decision.text(0.5, 0.15,
+    ax_decision.text(0.5, 0.30,
                      "Based on the information you provided,\nthe AI has made this recommendation.",
                      transform=ax_decision.transAxes, fontsize=10,
                      color=C_GRAY, ha="center", linespacing=1.5)
@@ -543,60 +718,81 @@ def dashboard_applicant(model_name, accent_col, data, model_pred, model_proba,
                           "Based on concepts that describe your profile",
                           fontsize=13, fontweight="bold", color=C_DARK, pad=15)
 
-    y_pos = 0.88
+    # Column headers
+    header_y = 0.93
+    ax_concepts.text(0.06, header_y, "Concept", transform=ax_concepts.transAxes,
+                     fontsize=10, fontweight="bold", color=C_GRAY)
+    ax_concepts.text(0.35, header_y, "Your Profile", transform=ax_concepts.transAxes,
+                     fontsize=10, fontweight="bold", color=C_GRAY)
+    ax_concepts.text(0.62, header_y, "Impact", transform=ax_concepts.transAxes,
+                     fontsize=10, fontweight="bold", color=C_GRAY)
+    ax_concepts.text(0.82, header_y, "Strength", transform=ax_concepts.transAxes,
+                     fontsize=10, fontweight="bold", color=C_GRAY)
+    # Header underline
+    ax_concepts.plot([0.04, 0.96], [header_y - 0.03, header_y - 0.03],
+                     color=C_GRAY + "55", lw=1, transform=ax_concepts.transAxes)
+
+    # Normalize arrow strengths: map max absolute LIME score to 5 arrows
+    max_abs = max(np.abs(scores).max(), 1e-6)
+
+    y_pos = 0.85
     for i, (concept_name, score) in enumerate(zip(concepts_list, scores)):
         applies = concept_status.get(concept_name, None)
-        influence = score if not np.isnan(score) else 0.5
+        influence = score  # LIME: positive = toward approval, negative = against
 
         # Determine impact for this applicant
-        if applies is True and influence > 0.5:
+        if applies is True and influence > 0:
             impact = "HELPED"
             impact_col = C_GREEN
-            icon = "+"
-        elif applies is True and influence <= 0.5:
+        elif applies is True and influence <= 0:
             impact = "HURT"
             impact_col = C_RED
-            icon = "-"
-        elif applies is False and influence > 0.5:
+        elif applies is False and influence > 0:
             impact = "MISSED OPPORTUNITY"
             impact_col = C_ORANGE
-            icon = "~"
-        elif applies is False and influence <= 0.5:
+        elif applies is False and influence <= 0:
             impact = "AVOIDED"
             impact_col = C_GREEN
-            icon = "+"
         else:
             impact = "UNKNOWN"
             impact_col = C_GRAY
-            icon = "?"
 
-        # Card for this concept
-        card_color = impact_col + "12"
-        edge_color = impact_col + "55"
-        ax_concepts.add_patch(mpatches.FancyBboxPatch(
-            (0.02, y_pos - 0.12), 0.96, 0.11, boxstyle="round,pad=0.015",
-            facecolor=card_color, edgecolor=edge_color, linewidth=1.5,
-            transform=ax_concepts.transAxes, clip_on=False))
+        # Strength: 1-5 arrows scaled relative to the strongest concept
+        strength = min(5, max(1, round(abs(influence) / max_abs * 5)))
+        if influence > 0:
+            arrow = "\u25B2"   # up triangle
+            arrow_col = C_GREEN
+        else:
+            arrow = "\u25BC"   # down triangle
+            arrow_col = C_RED
 
         # Concept name
-        ax_concepts.text(0.05, y_pos - 0.04, concept_name,
+        ax_concepts.text(0.06, y_pos - 0.04, concept_name,
                          transform=ax_concepts.transAxes, fontsize=11,
                          fontweight="bold", color=C_DARK)
 
         # Applies to you?
         applies_text = "Applies to you" if applies else "Does not apply to you"
-        ax_concepts.text(0.38, y_pos - 0.04, applies_text,
+        ax_concepts.text(0.35, y_pos - 0.04, applies_text,
                          transform=ax_concepts.transAxes, fontsize=10,
                          color=C_DARK, style="italic")
 
-        # Impact
-        ax_concepts.text(0.68, y_pos - 0.04, f"[{icon}] {impact}",
+        # Impact label
+        ax_concepts.text(0.62, y_pos - 0.04, impact,
                          transform=ax_concepts.transAxes, fontsize=10,
                          fontweight="bold", color=impact_col)
 
-        # Influence score
-        ax_concepts.text(0.88, y_pos - 0.04, f"Score: {score:.2f}" if not np.isnan(score) else "",
-                         transform=ax_concepts.transAxes, fontsize=9, color=C_GRAY)
+        # Strength indicator: colored arrows + gray filled dots at fixed positions
+        for k in range(5):
+            x_pos = 0.82 + k * 0.01
+            if k < strength:
+                ax_concepts.text(x_pos, y_pos - 0.04, arrow,
+                                 transform=ax_concepts.transAxes, fontsize=11,
+                                 color=arrow_col, fontweight="bold", ha="center")
+            else:
+                ax_concepts.text(x_pos, y_pos - 0.04, "\u25CF",
+                                 transform=ax_concepts.transAxes, fontsize=11,
+                                 color=C_GRAY + "55", ha="center")
 
         y_pos -= 0.145
 
@@ -610,7 +806,7 @@ def dashboard_applicant(model_name, accent_col, data, model_pred, model_proba,
     tips = []
     for concept_name, score in zip(concepts_list, scores):
         applies = concept_status.get(concept_name, None)
-        if applies is False and not np.isnan(score) and score > 0.5:
+        if applies is False and score > 0:
             if "college" in concept_name.lower() or "educated" in concept_name.lower():
                 tips.append(("Get a qualification", "A degree or diploma could\nimprove your chances significantly."))
             elif "investment" in concept_name.lower():
@@ -719,7 +915,8 @@ def main():
         dashboard_director(model_name, color, data, pred, proba, y_test, demo_test)
 
         print(f"[{i*3+3}/6] Applicant — {model_name}...")
-        dashboard_applicant(model_name, color, data, pred, proba, y_test, demo_test, raw_test)
+        dashboard_applicant(model_name, color, data, pred, proba, y_test, demo_test, raw_test,
+                            xgb_model, nn_model, X_test_xgb)
 
     print(f"\nDone! All 6 dashboards saved to: {OUTPUT_DIR}")
 
